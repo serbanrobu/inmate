@@ -7,20 +7,31 @@ fn main() -> Result<()> {
     let mut env = Env::new();
 
     let defs = [
-        ("the", "Pi(U(254), \\A. A -> A)", Some("\\_. \\a. a")),
+        ("the", r#"Pi(U(254), \A. A -> A)"#, Some(r#"\_. \a. a"#)),
+        ("Not", r#"U(254) -> U(254)"#, Some(r#"\A. A -> Void"#)),
         (
             "recBool",
-            "Pi(U(254), \\C. C -> C -> Bool -> C)",
-            Some("\\C. \\c0. \\c1. \\b. indBool(\\_. C, c0, c1, b)"),
+            r#"Pi(U(254), \C. C -> C -> Bool -> C)"#,
+            Some(r#"\C. \c0. \c1. \b. indBool(\_. C, c0, c1, b)"#),
         ),
         (
             "recVoid",
-            "Pi(U(254), \\C. Void -> C)",
-            Some("\\C. \\x. indVoid(\\_. C, x)"),
+            r#"Pi(U(254), \C. Void -> C)"#,
+            Some(r#"\C. \x. indVoid(\_. C, x)"#),
         ),
-        ("Command", "U(0)", None),
-        ("quit", "Command", None),
-        ("eval", "Pi(U(254), \\A. A -> Command)", None),
+        (
+            "Prod",
+            r#"U(0) -> U(0) -> U(0)"#,
+            Some(r#"\A. \B. Sigma(A, \_. B)"#),
+        ),
+        (
+            "fst",
+            r#"Pi(U(0), \A. Pi(U(0), \B. Prod(A, B) -> A))"#,
+            None,
+        ),
+        ("Command", r#"U(0)"#, None),
+        ("quit", r#"Command"#, None),
+        ("eval", r#"Pi(U(254), \A. A -> Command)"#, None),
     ];
 
     for (name, r#type, term) in defs {

@@ -6,7 +6,7 @@ use nom::{
     character::complete::{alpha1, alphanumeric1, char, multispace0, u8},
     combinator::{eof, map, recognize, value},
     error::Error,
-    multi::{many0, separated_list1},
+    multi::{many0, many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
     Finish, IResult,
 };
@@ -14,11 +14,15 @@ use nom::{
 use crate::{Expr, Lambda, Name};
 
 fn parse_name(input: &str) -> IResult<&str, Name> {
+    fn base(input: &str) -> IResult<&str, &str> {
+        alt((alphanumeric1, tag("_"), tag("\'")))(input)
+    }
+
     map(
-        recognize(pair(
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_"), tag("\'")))),
-        )),
+        recognize(alt((
+            pair(alpha1, many0(base)),
+            pair(tag("_"), many1(base)),
+        ))),
         str::to_owned,
     )(input)
 }
@@ -26,7 +30,10 @@ fn parse_name(input: &str) -> IResult<&str, Name> {
 fn parse_lambda(input: &str) -> IResult<&str, Lambda> {
     map(
         pair(
-            preceded(pair(char('\\'), multispace0), parse_name),
+            preceded(
+                pair(char('\\'), multispace0),
+                alt((value(None, tag("_")), map(parse_name, Some))),
+            ),
             preceded(ws(char('.')), parse_lambda_layer),
         ),
         |(x, b)| Lambda { x, b },
@@ -54,6 +61,16 @@ fn parse_atom(input: &str) -> IResult<&str, Expr> {
         },
     );
 
+    let pair_layer = map(
+        parens(ws(separated_list1(ws(char(',')), parse_expr))),
+        |es| {
+            es.into_iter()
+                .rev()
+                .reduce(|acc, e| Expr::Pair(Box::new(e), Box::new(acc)))
+                .unwrap()
+        },
+    );
+
     let pi_type = map(
         preceded(
             pair(tag("Pi"), multispace0),
@@ -78,6 +95,17 @@ fn parse_atom(input: &str) -> IResult<&str, Expr> {
             e_type: Box::new(e_type),
             e: Box::new(e),
             w: Box::new(w),
+        },
+    );
+
+    let sigma_type = map(
+        preceded(
+            pair(tag("Sigma"), multispace0),
+            parens(separated_pair(ws(parse_expr), char(','), ws(parse_expr))),
+        ),
+        |(a_type, b_type)| Expr::SigmaType {
+            a_type: Box::new(a_type),
+            b_type: Box::new(b_type),
         },
     );
 
@@ -127,12 +155,13 @@ fn parse_atom(input: &str) -> IResult<&str, Expr> {
     let var = map(parse_name, Expr::Var);
 
     alt((
-        parens(ws(parse_expr)),
         bool_type,
         ind_bool,
         value(Expr::False, tag("false")),
+        pair_layer,
         pi_type,
         rec_w,
+        sigma_type,
         sup,
         value(Expr::True, tag("true")),
         unit,
@@ -173,10 +202,7 @@ fn parse_function_type_layer(input: &str) -> IResult<&str, Expr> {
                 .rev()
                 .reduce(|acc, e| Expr::PiType {
                     a_type: Box::new(e),
-                    b_type: Box::new(Lambda {
-                        x: Name::from("_"),
-                        b: acc,
-                    }),
+                    b_type: Box::new(Lambda { x: None, b: acc }),
                 })
                 .unwrap()
         },

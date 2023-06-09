@@ -1,6 +1,7 @@
 mod parser;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
 };
@@ -16,17 +17,27 @@ pub struct Closure(Env, Lambda);
 impl Closure {
     pub fn application(self, argument: Value) -> Value {
         let Closure(mut env, Lambda { x, b }) = self;
-        env.insert(x, argument);
+
+        if let Some(x) = x {
+            env.insert(x, argument);
+        }
+
         b.eval(&env)
     }
 
     pub fn quote(&self, names: &HashSet<Name>) -> Lambda {
         let Closure(env, Lambda { x, b }) = self;
-        let x = freshen(x.to_owned(), &names);
-        let mut names = names.to_owned();
-        names.insert(x.clone());
-        let mut env = env.to_owned();
-        env.insert(x.clone(), Value::var(x.clone()));
+
+        let mut names = Cow::Borrowed(names);
+        let mut env = Cow::Borrowed(env);
+
+        let x = x.as_ref().map(|x| {
+            let y = freshen(x.to_owned(), &names);
+            names.to_mut().insert(y.clone());
+            env.to_mut().insert(x.to_owned(), Value::var(y.clone()));
+            y
+        });
+
         let b = b.eval(&env).quote(&names);
         Lambda { x, b }
     }
@@ -51,6 +62,7 @@ pub enum Expr {
         void: Box<Expr>,
     },
     Lambda(Box<Lambda>),
+    Pair(Box<Expr>, Box<Expr>),
     PiType {
         a_type: Box<Expr>,
         b_type: Box<Lambda>,
@@ -59,6 +71,10 @@ pub enum Expr {
         e_type: Box<Expr>,
         e: Box<Expr>,
         w: Box<Expr>,
+    },
+    SigmaType {
+        a_type: Box<Expr>,
+        b_type: Box<Expr>,
     },
     Sup {
         a: Box<Expr>,
@@ -135,6 +151,10 @@ impl Expr {
             (Self::Lambda(lambda), Self::Lambda(other_lambda)) => {
                 lambda.alpha_eq_(other_lambda, i, names, other_names, level_op)
             }
+            (Self::Pair(a, b), Self::Pair(other_a, other_b)) => {
+                a.alpha_eq_(other_a, i, names, other_names, level_op)
+                    && b.alpha_eq_(other_b, i, names, other_names, level_op)
+            }
             (
                 Self::PiType { a_type, b_type },
                 Self::PiType {
@@ -156,6 +176,16 @@ impl Expr {
                 e_type.alpha_eq_(other_e_type, i, names, other_names, level_op)
                     && e.alpha_eq_(other_e, i, names, other_names, level_op)
                     && w.alpha_eq_(other_w, i, names, other_names, level_op)
+            }
+            (
+                Self::SigmaType { a_type, b_type },
+                Self::SigmaType {
+                    a_type: other_a_type,
+                    b_type: other_b_type,
+                },
+            ) => {
+                a_type.alpha_eq_(other_a_type, i, names, other_names, level_op)
+                    && b_type.alpha_eq_(other_b_type, i, names, other_names, level_op)
             }
             (
                 Self::Sup { a, u },
@@ -208,19 +238,24 @@ impl Expr {
                 Ok(())
             }
             Self::Lambda(lambda) => {
-                let Lambda { x, b } = lambda.as_ref();
-
                 let Type::PiType { a_type, b_type } = r#type else {
                     return Err(eyre!("expected a term of type {type}, found {self}"));
                 };
 
-                let mut context = context.to_owned();
-                context.insert(x.to_owned(), a_type.as_ref().to_owned());
-                b.check(
-                    &b_type.to_owned().application(Value::var(x.to_owned())),
-                    &context,
+                lambda.check(
+                    a_type.as_ref().to_owned(),
+                    b_type.to_owned(),
+                    context.to_owned(),
                     env,
                 )
+            }
+            Self::Pair(a, b) => {
+                let Type::SigmaType { a_type, b_type } = r#type else {
+                    return Err(eyre!("expected a term of type {type}, found {self}"));
+                };
+
+                a.check(a_type, context, env)?;
+                b.check(&b_type.to_owned().application(a.eval(env)), context, env)
             }
             Self::PiType { a_type, b_type } => {
                 let &Type::UType(i) = r#type else {
@@ -234,11 +269,33 @@ impl Expr {
                     Closure(
                         Env::new(),
                         Lambda {
-                            x: Name::from("_"),
+                            x: None,
                             b: Self::UType(i),
                         },
                     ),
                     context.to_owned(),
+                    env,
+                )
+            }
+            Self::SigmaType { a_type, b_type } => {
+                let &Type::UType(i) = r#type else {
+                    return Err(eyre!("expected a term of type {type}, found {self}"));
+                };
+
+                a_type.check(r#type, context, env)?;
+
+                b_type.check(
+                    &Type::PiType {
+                        a_type: Box::new(a_type.eval(env)),
+                        b_type: Closure(
+                            Env::new(),
+                            Lambda {
+                                x: None,
+                                b: Self::UType(i),
+                            },
+                        ),
+                    },
+                    context,
                     env,
                 )
             }
@@ -252,11 +309,11 @@ impl Expr {
 
                 u.check(
                     &Type::PiType {
-                        a_type: Box::new(b_type.as_ref().to_owned().application(a.eval(env))),
+                        a_type: Box::new(b_type.to_owned().application(a.eval(env))),
                         b_type: Closure(
                             Env::new(),
                             Lambda {
-                                x: Name::from("_"),
+                                x: None,
                                 b: r#type.quote(&names),
                             },
                         ),
@@ -317,7 +374,7 @@ impl Expr {
                         b_type: Closure(
                             Env::new(),
                             Lambda {
-                                x: Name::from("_"),
+                                x: None,
                                 b: Self::UType(i),
                             },
                         ),
@@ -375,6 +432,7 @@ impl Expr {
                 Value::ind_void(Box::new(c_type.eval(env)), void.eval(env))
             }
             Self::Lambda(lambda) => Value::Closure(lambda.to_owned().eval(env.to_owned())),
+            Self::Pair(a, b) => Value::Pair(Box::new(a.eval(env)), Box::new(b.eval(env))),
             Self::PiType { a_type, b_type } => Value::PiType {
                 a_type: Box::new(a_type.eval(env)),
                 b_type: b_type.to_owned().eval(env.to_owned()),
@@ -391,7 +449,7 @@ impl Expr {
                     .application(Value::Closure(Closure(
                         env.to_owned(),
                         Lambda {
-                            x: Name::from("b"),
+                            x: Some(Name::from("b")),
                             b: Self::RecW {
                                 e_type: e_type.to_owned(),
                                 e: e.to_owned(),
@@ -403,6 +461,10 @@ impl Expr {
                         },
                     )))
             }
+            Self::SigmaType { a_type, b_type } => Value::SigmaType {
+                a_type: Box::new(a_type.eval(env)),
+                b_type: Box::new(b_type.eval(env)),
+            },
             Self::Sup { a, u } => Value::Sup {
                 a: Box::new(a.eval(env)),
                 u: Box::new(u.eval(env)),
@@ -462,7 +524,7 @@ impl Expr {
                         b_type: Closure(
                             Env::new(),
                             Lambda {
-                                x: Name::from("_"),
+                                x: None,
                                 b: Self::UType(Level::MAX),
                             },
                         ),
@@ -489,7 +551,7 @@ impl Expr {
                         b_type: Closure(
                             Env::new(),
                             Lambda {
-                                x: Name::from("_"),
+                                x: None,
                                 b: Self::UType(Level::MAX),
                             },
                         ),
@@ -514,7 +576,7 @@ impl Expr {
                         b_type: Closure(
                             Env::new(),
                             Lambda {
-                                x: Name::from("_"),
+                                x: None,
                                 b: Self::UType(Level::MAX),
                             },
                         ),
@@ -539,7 +601,7 @@ impl Expr {
                         b_type: Closure(
                             env.to_owned(),
                             Lambda {
-                                x: Name::from("a"),
+                                x: Some(Name::from("a")),
                                 b: Self::PiType {
                                     a_type: Box::new(Self::PiType {
                                         a_type: Box::new(Self::Application {
@@ -547,12 +609,12 @@ impl Expr {
                                             argument: Box::new(Self::Var(Name::from("a"))),
                                         }),
                                         b_type: Box::new(Lambda {
-                                            x: Name::from("_"),
+                                            x: None,
                                             b: w_type.quote(&names),
                                         }),
                                     }),
                                     b_type: Box::new(Lambda {
-                                        x: Name::from("f"),
+                                        x: Some(Name::from("f")),
                                         b: Self::PiType {
                                             a_type: Box::new(Self::PiType {
                                                 a_type: Box::new(Self::Application {
@@ -560,7 +622,7 @@ impl Expr {
                                                     argument: Box::new(Self::Var(Name::from("a"))),
                                                 }),
                                                 b_type: Box::new(Lambda {
-                                                    x: Name::from("b"),
+                                                    x: Some(Name::from("b")),
                                                     b: Self::Application {
                                                         function: e_type.to_owned(),
                                                         argument: Box::new(Self::Application {
@@ -575,7 +637,7 @@ impl Expr {
                                                 }),
                                             }),
                                             b_type: Box::new(Lambda {
-                                                x: Name::from("_"),
+                                                x: None,
                                                 b: Self::Application {
                                                     function: e_type.to_owned(),
                                                     argument: Box::new(Self::Sup {
@@ -612,8 +674,10 @@ impl Expr {
             Self::IndBool { .. } => Precedence::Atom,
             Self::IndVoid { .. } => Precedence::Atom,
             Self::Lambda { .. } => Precedence::Lambda,
+            Self::Pair(_, _) => Precedence::Atom,
             Self::PiType { .. } => Precedence::Atom,
             Self::RecW { .. } => Precedence::Atom,
+            Self::SigmaType { .. } => Precedence::Atom,
             Self::Sup { .. } => Precedence::Atom,
             Self::True => Precedence::Atom,
             Self::Unit => Precedence::Atom,
@@ -639,7 +703,7 @@ impl fmt::Display for Expr {
                 function: func,
                 argument,
             } => {
-                let mut function: &Self = &func;
+                let mut function: &Self = func;
                 let mut arguments = vec![];
 
                 loop {
@@ -678,8 +742,10 @@ impl fmt::Display for Expr {
             } => write!(f, "indBool({c_type}, {c_0}, {c_1}, {bool})"),
             Self::IndVoid { c_type, void } => write!(f, "indVoid({c_type}, {void})"),
             Self::Lambda(lambda) => lambda.fmt(f),
+            Self::Pair(a, b) => write!(f, "({a}, {b})"),
             Self::PiType { a_type, b_type } => write!(f, "Pi({a_type}, {b_type})"),
             Self::RecW { e_type, e, w } => write!(f, "recW({e_type}, {e}, {w})"),
+            Self::SigmaType { a_type, b_type } => write!(f, "Sigma({a_type}, {b_type})"),
             Self::Sup { a, u } => write!(f, "sup({a}, {u})"),
             Self::True => "true".fmt(f),
             Self::Unit => "unit".fmt(f),
@@ -728,7 +794,7 @@ pub fn fmt_context(context: &Context, f: &mut fmt::Formatter<'_>) -> fmt::Result
 
 #[derive(Clone, Debug, Eq)]
 pub struct Lambda {
-    x: Name,
+    x: Option<Name>,
     b: Expr,
 }
 
@@ -754,21 +820,19 @@ impl Lambda {
             },
         ) = (self, other);
 
-        b.alpha_eq_(
-            other_b,
-            i + 1,
-            &{
-                let mut names = names.to_owned();
-                names.insert(x.to_owned(), i);
-                names
-            },
-            &{
-                let mut other_names = other_names.to_owned();
-                other_names.insert(other_x.to_owned(), i);
-                other_names
-            },
-            level_op,
-        )
+        let mut names = Cow::Borrowed(names);
+
+        if let Some(x) = x {
+            names.to_mut().insert(x.to_owned(), i);
+        }
+
+        let mut other_names = Cow::Borrowed(other_names);
+
+        if let Some(other_x) = other_x {
+            other_names.to_mut().insert(other_x.to_owned(), i);
+        }
+
+        b.alpha_eq_(other_b, i + 1, &names, &other_names, level_op)
     }
 
     pub fn check(
@@ -779,9 +843,21 @@ impl Lambda {
         env: &Env,
     ) -> Result<()> {
         let Lambda { x, b } = self;
-        context.insert(x.to_owned(), a_type);
 
-        b.check(&b_type.application(Value::var(x.to_owned())), &context, env)
+        let b_type = if let Some(x) = x {
+            context.insert(x.to_owned(), a_type);
+            b_type.application(Value::var(x.to_owned()))
+        } else {
+            let Closure(env, Lambda { x, b }) = b_type;
+
+            if let Some(x) = x {
+                context.insert(x, a_type);
+            }
+
+            b.eval(&env)
+        };
+
+        b.check(&b_type, &context, env)
     }
 
     pub fn eval(self, env: Env) -> Closure {
@@ -792,7 +868,12 @@ impl Lambda {
 impl fmt::Display for Lambda {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Lambda { x, b } = self;
-        write!(f, "\\{x}. {b}")
+
+        write!(
+            f,
+            "\\{}. {b}",
+            x.as_ref().map(String::as_str).unwrap_or("_")
+        )
     }
 }
 
@@ -868,9 +949,14 @@ pub enum Value {
     False,
     Closure(Closure),
     Neutral(Neutral),
+    Pair(Box<Value>, Box<Value>),
     PiType {
         a_type: Box<Value>,
         b_type: Closure,
+    },
+    SigmaType {
+        a_type: Box<Value>,
+        b_type: Box<Value>,
     },
     Sup {
         a: Box<Value>,
@@ -906,23 +992,32 @@ impl Value {
             Self::Closure(closure) => {
                 let Lambda { x, b } = closure.quote(names);
 
-                if let Expr::Application { function, argument } = b {
-                    if let Expr::Var(name) = argument.as_ref() {
-                        if name == &x {
-                            return *function;
+                if let Some(x) = x {
+                    if let Expr::Application { function, argument } = b {
+                        if let Expr::Var(name) = argument.as_ref() {
+                            if name == &x {
+                                return *function;
+                            }
                         }
+
+                        return Expr::Lambda(Box::new(Lambda {
+                            x: Some(x),
+                            b: Expr::Application { function, argument },
+                        }));
                     }
 
-                    return Expr::Lambda(Box::new(Lambda {
-                        x,
-                        b: Expr::Application { function, argument },
-                    }));
+                    return Expr::Lambda(Box::new(Lambda { x: Some(x), b }));
                 }
 
-                Expr::Lambda(Box::new(Lambda { x, b }))
+                Expr::Lambda(Box::new(Lambda { x: None, b }))
             }
             Self::Neutral(neutral) => neutral.quote(names),
+            Self::Pair(a, b) => Expr::Pair(Box::new(a.quote(names)), Box::new(b.quote(names))),
             Self::PiType { a_type, b_type } => Expr::PiType {
+                a_type: Box::new(a_type.quote(names)),
+                b_type: Box::new(b_type.quote(names)),
+            },
+            Self::SigmaType { a_type, b_type } => Expr::SigmaType {
                 a_type: Box::new(a_type.quote(names)),
                 b_type: Box::new(b_type.quote(names)),
             },
@@ -1006,7 +1101,7 @@ mod tests {
                     b_type: Closure(
                         Env::new(),
                         Lambda {
-                            x: Name::from("_"),
+                            x: None,
                             b: Expr::UType(0),
                         },
                     ),
